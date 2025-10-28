@@ -310,13 +310,11 @@ class GRPO:
         
         return eval_results
 
-    def train(self, epochs=1, max_iterations=1000):
-        idx = 0
-        start_time = time.perf_counter()
+    def train(self, max_iterations=1000, eval_interval=10):
         
-        # while idx < max_iterations:
+        start_time = time.perf_counter()
             
-        for idx in tqdm(range(max_iterations)):
+        for idx in tqdm(range(1, max_iterations + 1)):
 
             x_batch_inputs, rewards, loss_mask = self.sample_batch()
 
@@ -372,6 +370,10 @@ class GRPO:
                     self.metrics["idx"].append(idx)
                     self.metrics["total_reward"].append(reward.mean().item())
                     self.metrics["loss"].append(sum(group_losses)/len(group_losses))
+              
+              
+            if idx % eval_interval == 0:
+                eval_results = self.evaluate(num_samples=40)
                 
             print(f"iter {idx}  >>> reward: {rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
