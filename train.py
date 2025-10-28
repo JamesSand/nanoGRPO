@@ -6,6 +6,9 @@ from rich import print
 import math
 from grpo import GRPO
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
 
 SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
 
