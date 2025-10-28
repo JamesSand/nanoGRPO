@@ -13,7 +13,7 @@ class GRPO:
     def __init__(
         self,
         model,
-        ref_model,
+        ref_model=None,
         dataset=None,
         test_dataset=None,
         tokenizer=None,
@@ -21,6 +21,7 @@ class GRPO:
         micro_group_size=2,
         batch_size=1,
         max_iterations=1000,    
+        max_new_tokens=512,
         reward_functions=None,
         log_wandb=False,
         dtype=None,
@@ -48,6 +49,7 @@ class GRPO:
         self.micro_group_size = micro_group_size   
         self.batch_size = batch_size
         self.max_iterations = max_iterations
+        self.max_new_tokens = max_new_tokens
         self.dtype = dtype if dtype is not None else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
         self.beta = beta
         self.epsilon = epsilon
@@ -56,6 +58,8 @@ class GRPO:
         self.reward_functions: list = reward_functions
 
         # self.using_lora = True if self.ref_model is None else False
+        
+        self.current_step = 0
         
         self.using_lora = True
         if self.using_lora:
@@ -79,6 +83,7 @@ class GRPO:
         return torch.gather(logps, -1, input_ids.unsqueeze(-1)).squeeze(-1)
 
     def compute_loss(self, inputs, old_policy_log_probs, reward, mean_rewards, std_rewards, loss_mask) -> Tensor:
+        # [B, T]
         policy_log_probs = self.get_per_token_logps(self.model, inputs)
         
         with (
@@ -90,24 +95,31 @@ class GRPO:
 
 
         # advantage calculation
+        # [B]
         advantage: Tensor = (reward - mean_rewards) / (std_rewards + 1e-6)
+        # boradcast to token level
+        # [B, 1]
         advantage = advantage.reshape(-1, 1)
 
         # kl divergence calculation
+        # Here, they use k3 divergence 
+        # http://joschu.net/blog/kl-approx.html 
         log_ratios = ref_policy_log_probs - policy_log_probs
         kld = torch.exp(log_ratios) - log_ratios - 1
 
-        policy_ratio = torch.exp(policy_log_probs-old_policy_log_probs.detach())
+        policy_ratio = torch.exp(policy_log_probs - old_policy_log_probs.detach())
 
         loss1 = policy_ratio*advantage
         loss2 = torch.clamp(policy_ratio, 1 - self.epsilon, 1 + self.epsilon) * advantage
         loss = -torch.min(loss1, loss2)
+        
         loss = (loss * loss_mask).sum(dim=-1)/ (loss_mask.sum(dim=-1) + 1e-6)
         kld = (kld * loss_mask).sum(dim=-1)/ (loss_mask.sum(dim=-1) + 1e-6)
         loss += kld * self.beta
+        
         if self.log_wandb:
             for _kd in kld:
-                self.metrics["kld"].append(_kd.mean().item())
+                self.metrics["kld"].append(_kd.item())
         return loss.mean()
 
     def sample_batch(self):
@@ -123,7 +135,7 @@ class GRPO:
             formatted = self.tokenizer.apply_chat_template(
                 prompt, 
                 tokenize=False, 
-                add_generation_prompt=True
+                add_generation_prompt=False
             )
             inputs_texts.append(formatted)
 
@@ -133,17 +145,17 @@ class GRPO:
 
         prompt_length = input_ids.shape[1]
 
+        # patch together for group generation
         input_ids = torch.repeat_interleave(input_ids, self.group_size, dim=0)
-        samples = [sample for _ in range(self.group_size) for sample in samples]
+        attention_mask = torch.repeat_interleave(attention_mask, self.group_size, dim=0)
+        samples = [sample for sample in samples for _ in range(self.group_size)]
 
         start_time = time.time()
-        max_new_tokens = 512
         outputs = self.model.generate(
             input_ids.to(self.device),
-            # min_new_tokens=512,
-            max_new_tokens=max_new_tokens,
-            temperature=0.9,
-            # repetition_penalty=1.1,
+            attention_mask=attention_mask.to(self.device),
+            max_new_tokens=self.max_new_tokens,
+            temperature=1.0,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
             do_sample=True,
@@ -153,15 +165,23 @@ class GRPO:
 
         decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         
-        rewards = self.compute_rewards(samples,decoded_outputs)
-
+        rewards = self.compute_rewards(samples, decoded_outputs)
+        
+        # save fisrt decode results and its reward
+        with open("generation_samples.txt", "a") as f:
+            f.write("=" * 50 + "\n")
+            f.write(decoded_outputs[0] + "\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Reward: {str(rewards[0])}\n")
+            
+            
         loss_mask = torch.zeros(outputs.shape, dtype=torch.bool)
 
         gen_tokens = outputs[:, prompt_length:]
         valid_gen_mask = gen_tokens != self.tokenizer.pad_token_id
         loss_mask[:, prompt_length:] = valid_gen_mask
 
-        return outputs, rewards.to(self.dtype).float(), loss_mask[:, 1:]
+        return outputs, rewards, loss_mask[:, 1:]
 
     def compute_rewards(self, samples, responces) -> Tensor:
         """
@@ -181,33 +201,54 @@ class GRPO:
             reward = self.reward_functions[0](sample, resp)
             rewards[idx % self.batch_size].append(reward)
         
-        rewards = torch.tensor(rewards, dtype=self.dtype).to(self.device)
+        # Rewards should be in float32 for numerical stability
+        rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
         
         # Log average reward across groups
-        avg_rewards = rewards.mean(dim=-1)
-        for r in avg_rewards:
-            self.metrics[f"reward"].append(r.item())
-        
-        # Log prompt lengths
-        prompt_lengths = [[] for _ in range(self.batch_size)]
-        for idx, sample in enumerate(samples):
-            prompt_lengths[idx % self.batch_size].append(len(sample["prompt"]))
-        
-        for idx, pl in enumerate(prompt_lengths):
-            self.metrics[f"prompt_length"].append(sum(pl) / len(pl))
+        if self.log_wandb:
+            avg_rewards = rewards.mean(dim=-1)
+            for r in avg_rewards:
+                self.metrics["reward"].append(r.item())
+            
+            # Log prompt lengths
+            prompt_lengths = [[] for _ in range(self.batch_size)]
+            for idx, sample in enumerate(samples):
+                prompt_lengths[idx % self.batch_size].append(len(sample["prompt"]))
+            
+            for idx, pl in enumerate(prompt_lengths):
+                self.metrics["prompt_length"].append(sum(pl) / len(pl))
         
         return rewards
     
-    def log_metrics(self):
-        if self.log_wandb:
-            idx = self.metrics["idx"][-1]-1
-            metrics = {}
-            for k, v in self.metrics.items():
-                metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
-                
-            wandb.log(metrics)
+    def log_metrics(self, step):
+        """Log metrics to wandb for the current step."""
+        if not self.log_wandb:
+            return
+        
+        metrics = {"step": step}
+        
+        # Log training metrics (average over the step)
+        if "loss" in self.metrics and len(self.metrics["loss"]) > 0:
+            metrics["train/loss"] = sum(self.metrics["loss"]) / len(self.metrics["loss"])
+        
+        if "reward" in self.metrics and len(self.metrics["reward"]) > 0:
+            metrics["train/reward"] = sum(self.metrics["reward"]) / len(self.metrics["reward"])
+        
+        if "kld" in self.metrics and len(self.metrics["kld"]) > 0:
+            metrics["train/kld"] = sum(self.metrics["kld"]) / len(self.metrics["kld"])
+        
+        if "prompt_length" in self.metrics and len(self.metrics["prompt_length"]) > 0:
+            metrics["train/prompt_length"] = sum(self.metrics["prompt_length"]) / len(self.metrics["prompt_length"])
+        
+        wandb.log(metrics, step=step)
+        
+        # Clear metrics for next step
+        self.metrics["loss"].clear()
+        self.metrics["reward"].clear()
+        self.metrics["kld"].clear()
+        self.metrics["prompt_length"].clear()
 
-    def evaluate(self, num_samples=None, eval_batch_size=None):
+    def evaluate(self, num_samples=64, eval_batch_size=None):
         """
         Evaluate the model on test_dataset.
         
@@ -248,38 +289,35 @@ class GRPO:
                     formatted = self.tokenizer.apply_chat_template(
                         prompt, 
                         tokenize=False, 
-                        add_generation_prompt=True
+                        add_generation_prompt=False
                     )
                     inputs_texts.append(formatted)
                 
                 # Tokenize inputs
                 encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
                 input_ids = encoded["input_ids"]
-                
+                attention_mask = encoded["attention_mask"]
+
                 # Generate responses (use greedy decoding for faster and more deterministic evaluation)
                 outputs = self.model.generate(
                     input_ids.to(self.device),
-                    max_new_tokens=512,
+                    max_new_tokens=self.max_new_tokens,
+                    attention_mask=attention_mask.to(self.device),
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    num_beams=1,       # Explicitly use greedy search
-                    do_sample=False,   # Disable sampling
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    top_k=None,
                 )
                 
                 # Decode outputs
                 decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
                 
                 # Compute rewards for this batch
-                batch_rewards = []
                 for sample, resp in zip(batch_samples, decoded_outputs):
                     reward = self.reward_functions[0](sample, resp)
-                    batch_rewards.append(reward)
-                
-                all_rewards.extend(batch_rewards)
-                
-                # Clear GPU cache periodically
-                if (i // eval_batch_size) % 10 == 0:
-                    torch.cuda.empty_cache()
+                    all_rewards.append(reward)
         
         self.model.train()
         
@@ -306,41 +344,48 @@ class GRPO:
         
         # Log to wandb if enabled
         if self.log_wandb:
-            wandb.log(eval_results)
+            eval_metrics = {
+                "step": self.current_step,
+                "eval/avg_reward": avg_reward,
+                "eval/max_reward": max_reward,
+                "eval/min_reward": min_reward,
+                "eval/num_samples": len(all_rewards)
+            }
+            wandb.log(eval_metrics, step=self.current_step)
         
         return eval_results
 
-    def train(self, max_iterations=1000, eval_interval=10):
+    def train(self, max_iterations=1000, eval_interval=5):
         
         start_time = time.perf_counter()
+        iter_count = 0
             
-        for idx in tqdm(range(1, max_iterations + 1)):
+        for global_step in tqdm(range(1, max_iterations + 1)):
 
             x_batch_inputs, rewards, loss_mask = self.sample_batch()
 
             batch_inputs = x_batch_inputs.reshape(self.batch_size, self.group_size, *x_batch_inputs.shape[1:])
-            loss_mask =       loss_mask.reshape(self.batch_size, self.group_size, *loss_mask.shape[1:])
+            loss_mask = loss_mask.reshape(self.batch_size, self.group_size, *loss_mask.shape[1:])
 
             pi_old = []
             for _, (b_inputs) in enumerate(batch_inputs):
                 
                 with torch.no_grad():
-                    b_old_policy_log_probs = self.get_per_token_logps(self.model, b_inputs.to(self.device)).cpu()
-                    torch.cuda.empty_cache()
+                    b_old_policy_log_probs = self.get_per_token_logps(self.model, b_inputs.to(self.device))
                     pi_old.append(b_old_policy_log_probs)
 
-            for _, (b_inputs,b_old_policy_log_probs, b_reward, b_loss_mask) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
-                idx += 1
+            for _, (b_inputs, b_old_policy_log_probs, b_reward, b_loss_mask) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
+                iter_count += 1
                 reward = b_reward.to(self.device)
                 mean_rewards = reward.mean(dim=-1).unsqueeze(-1)
                 std_rewards = reward.std(dim=-1).unsqueeze(-1)
 
-                # even grop are too big for vram
+                # even group are too big for vram
                 # so we split them into micro groups (its same as micro batching)
-                g_inputs                =                b_inputs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_inputs.shape[1:]).cpu()
-                g_old_policy_log_probs  =  b_old_policy_log_probs.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_old_policy_log_probs.shape[1:]).cpu()
-                g_reward =                               b_reward.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_reward.shape[1:]).cpu()
-                g_loss_mask =                         b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size,self.micro_group_size, *b_loss_mask.shape[1:]).cpu()
+                g_inputs = b_inputs.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_inputs.shape[1:])
+                g_old_policy_log_probs = b_old_policy_log_probs.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_old_policy_log_probs.shape[1:])
+                g_reward = b_reward.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_reward.shape[1:])
+                g_loss_mask = b_loss_mask.reshape(b_inputs.shape[0]//self.micro_group_size, self.micro_group_size, *b_loss_mask.shape[1:])
                 group_losses = []
                 
 
@@ -365,16 +410,20 @@ class GRPO:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
 
-                print(f"{idx:04d} loss: {sum(group_losses)/len(group_losses)} reward: {reward.mean()}")
-                if self.log_wandb:
-                    self.metrics["idx"].append(idx)
-                    self.metrics["total_reward"].append(reward.mean().item())
-                    self.metrics["loss"].append(sum(group_losses)/len(group_losses))
-              
-              
-            if idx % eval_interval == 0:
-                eval_results = self.evaluate(num_samples=40)
+                avg_loss = sum(group_losses) / len(group_losses)
+                avg_reward = reward.mean().item()
                 
-            print(f"iter {idx}  >>> reward: {rewards.mean()}")
+                print(f"Step {global_step:04d} | Batch {iter_count:04d} | loss: {avg_loss:.4f} | reward: {avg_reward:.4f}")
+                
+                if self.log_wandb:
+                    self.metrics["loss"].append(avg_loss)
+              
+            # Store current step for evaluation logging
+            self.current_step = global_step
+              
+            if global_step % eval_interval == 0:
+                eval_results = self.evaluate(num_samples=64)
+                
+            print(f"Step {global_step}  >>> reward: {rewards.mean():.4f}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")
-            self.log_metrics()
+            self.log_metrics(global_step)

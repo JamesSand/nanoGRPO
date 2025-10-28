@@ -60,22 +60,22 @@ def prepare_dataset(dataset) -> Dataset:
     return dataset
 
 
-# model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
 # small models are kind of dumb, they need a little push so using this fine-tuned model
 # source: https://github.com/joey00072/nanoGRPO/blob/master/cold_start/cold_start_finetune.py
 # you can totally use the base model, it will just take longer to converge
-model_name = "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
+# model_name = "joey00072/Llama-3.2-1B-Instruct-cold-start-ft2"
 
 # model_name = "unsloth/Llama-3.2-3B-Instruct"
 
 
 model = AutoModelForCausalLM.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer.padding_side = "left"
 
 lora_config = LoraConfig(
-    r=8,
-    lora_alpha=16,
-    # lora_dropout=0.1,
+    r=32,
+    lora_alpha=32,
 )
 model = get_peft_model(model, lora_config)
 model = model.to(torch.bfloat16)
@@ -191,9 +191,9 @@ test_dataset = load_dataset("openai/gsm8k", "main")["test"]
 test_dataset = prepare_dataset(test_dataset)
 
 group_size = 8
-micro_group_size =2
-lr = 5e-6
-weight_decay = 0.1
+micro_group_size = 8
+lr = 5e-5
+weight_decay = 1e-2
 reward_functions = [
     # response_format_reward,
     math_verify_reward,
@@ -201,13 +201,13 @@ reward_functions = [
 
 # print(model)
 
-enable_wandb = False
+enable_wandb = True
 
-ref_model = None
 trainer = GRPO(
     model,
-    ref_model,
     tokenizer=tokenizer,
+    batch_size=4,
+    max_new_tokens=1024,
     group_size=group_size,
     micro_group_size=micro_group_size,
     dataset=dataset,
@@ -218,7 +218,7 @@ trainer = GRPO(
     weight_decay=weight_decay
 )
 
-eval_results = trainer.evaluate(num_samples=40)
+eval_results = trainer.evaluate(num_samples=64)
 
 # print(eval_results)
 # breakpoint()
