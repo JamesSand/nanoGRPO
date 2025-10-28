@@ -187,6 +187,9 @@ def math_verify_reward(sample: dict, s: str, *args, **kwargs):
 dataset = load_dataset("openai/gsm8k", "main")["train"]
 dataset = prepare_dataset(dataset)
 
+test_dataset = load_dataset("openai/gsm8k", "main")["test"]
+test_dataset = prepare_dataset(test_dataset)
+
 group_size = 8
 micro_group_size =2
 lr = 5e-6
@@ -198,7 +201,7 @@ reward_functions = [
 
 # print(model)
 
-enable_wandb = True
+enable_wandb = False
 
 ref_model = None
 trainer = GRPO(
@@ -208,10 +211,16 @@ trainer = GRPO(
     group_size=group_size,
     micro_group_size=micro_group_size,
     dataset=dataset,
+    test_dataset=test_dataset,
     reward_functions=reward_functions,
     log_wandb=enable_wandb,
     lr=lr,
     weight_decay=weight_decay
 )
+
+eval_results = trainer.evaluate(num_samples=20)
+
+print(eval_results)
+breakpoint()
 
 trainer.train()

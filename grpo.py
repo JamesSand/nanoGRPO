@@ -14,12 +14,13 @@ class GRPO:
         self,
         model,
         ref_model,
+        dataset=None,
+        test_dataset=None,
         tokenizer=None,
         group_size=8,
         micro_group_size=2,
         batch_size=1,
         max_iterations=1000,    
-        dataset=None,
         reward_functions=None,
         log_wandb=False,
         dtype=None,
@@ -40,6 +41,8 @@ class GRPO:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
             
         self.dataset = dataset.shuffle(seed=42)
+        self.test_dataset = test_dataset
+        
         self.data_loader_iter = iter(self.dataset)
         self.group_size = group_size
         self.micro_group_size = micro_group_size   
@@ -193,6 +196,108 @@ class GRPO:
                 metrics[f"train/{k}"] = v[idx] if len(v) >= idx else v[-1]
                 
             wandb.log(metrics)
+
+    def evaluate(self, num_samples=None, eval_batch_size=None):
+        """
+        Evaluate the model on test_dataset.
+        
+        Args:
+            num_samples: Number of samples to evaluate. If None, evaluate all test_dataset.
+            eval_batch_size: Batch size for evaluation. If None, use self.batch_size.
+        
+        Returns:
+            dict: Dictionary containing average rewards and other metrics
+        """
+        if self.test_dataset is None:
+            print("Warning: test_dataset is None, skipping evaluation")
+            return {}
+        
+        self.model.eval()
+        eval_batch_size = eval_batch_size or self.batch_size
+        
+        # Determine number of samples to evaluate
+        if num_samples is None:
+            test_data = list(self.test_dataset)
+        else:
+            test_data = list(self.test_dataset.select(range(min(num_samples, len(self.test_dataset)))))
+        
+        all_rewards = []
+        all_responses = []
+        
+        print(f"\n{'='*50}")
+        print(f"Starting evaluation on {len(test_data)} samples...")
+        print(f"{'='*50}\n")
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, len(test_data), eval_batch_size), desc="Evaluating"):
+                batch_samples = test_data[i:i + eval_batch_size]
+                inputs_texts = []
+                
+                for sample in batch_samples:
+                    prompt = sample["prompt"]
+                    formatted = self.tokenizer.apply_chat_template(
+                        prompt, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                    inputs_texts.append(formatted)
+                
+                # Tokenize inputs
+                encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
+                input_ids = encoded["input_ids"]
+                
+                # Generate responses
+                outputs = self.model.generate(
+                    input_ids.to(self.device),
+                    max_new_tokens=512,
+                    temperature=0.9,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    do_sample=True,
+                )
+                
+                # Decode outputs
+                decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                all_responses.extend(decoded_outputs)
+                
+                # Compute rewards for this batch
+                batch_rewards = []
+                for sample, resp in zip(batch_samples, decoded_outputs):
+                    reward = 0
+                    for func in self.reward_functions:
+                        reward += func(sample, resp)
+                    batch_rewards.append(reward)
+                
+                all_rewards.extend(batch_rewards)
+        
+        self.model.train()
+        
+        # Compute statistics
+        avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0
+        max_reward = max(all_rewards) if all_rewards else 0
+        min_reward = min(all_rewards) if all_rewards else 0
+        
+        eval_results = {
+            "eval/avg_reward": avg_reward,
+            "eval/max_reward": max_reward,
+            "eval/min_reward": min_reward,
+            "eval/num_samples": len(all_rewards)
+        }
+        
+        # Print results
+        print(f"\n{'='*50}")
+        print(f"Evaluation Results:")
+        print(f"  Average Reward: {avg_reward:.4f}")
+        print(f"  Max Reward: {max_reward:.4f}")
+        print(f"  Min Reward: {min_reward:.4f}")
+        print(f"  Num Samples: {len(all_rewards)}")
+        print(f"{'='*50}\n")
+        
+        # Log to wandb if enabled
+        if self.log_wandb:
+            wandb.log(eval_results)
+        
+        return eval_results
 
     def train(self, epochs=1, max_iterations=1000):
         idx = 0
