@@ -218,9 +218,9 @@ trainer = GRPO(
     weight_decay=weight_decay
 )
 
-eval_results = trainer.evaluate(num_samples=20)
+eval_results = trainer.evaluate(num_samples=40)
 
-print(eval_results)
-breakpoint()
+# print(eval_results)
+# breakpoint()
 
 trainer.train()

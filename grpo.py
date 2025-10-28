@@ -55,11 +55,13 @@ class GRPO:
         assert reward_functions is not None, "Must pass reward_functions"
         self.reward_functions: list = reward_functions
 
-        self.using_lora = True if self.ref_model is None else False
+        # self.using_lora = True if self.ref_model is None else False
+        
+        self.using_lora = True
         if self.using_lora:
             self.ref_model = model
 
-        self.distributed = False
+        # self.distributed = False
         self.log_wandb = log_wandb
         if self.log_wandb:
             wandb.init(project="nanoGRPO")
@@ -109,8 +111,8 @@ class GRPO:
         return loss.mean()
 
     def sample_batch(self):
-        if self.distributed:
-            return self.distributed_sample_batch()
+        # if self.distributed:
+        #     return self.distributed_sample_batch()
 
         inputs_texts = []
         samples = []
@@ -161,32 +163,40 @@ class GRPO:
 
         return outputs, rewards.to(self.dtype).float(), loss_mask[:, 1:]
 
-    def compute_rewards(self,samples, responces) -> list:
-        rewards = [[[] for _ in range(self.batch_size)] for _ in range(len(self.reward_functions))]
+    def compute_rewards(self, samples, responces) -> Tensor:
+        """
+        Compute rewards for responses using the reward function.
+        
+        Args:
+            samples: List of sample data
+            responces: List of response strings
+            
+        Returns:
+            Tensor: Rewards with shape [batch_size, group_size]
+        """
+        # Initialize rewards structure: [batch_size][group_size]
+        rewards = [[] for _ in range(self.batch_size)]
         
         for idx, (sample, resp) in enumerate(zip(samples, responces)):
-            reward = 0
-            for func_idx, func in enumerate(self.reward_functions):
-                reward += func(sample, resp)
-                # print(f"{func.__name__} reward: {reward}")
-                rewards[func_idx][idx % self.batch_size].append(reward)
-
+            reward = self.reward_functions[0](sample, resp)
+            rewards[idx % self.batch_size].append(reward)
+        
         rewards = torch.tensor(rewards, dtype=self.dtype).to(self.device)
-
-        # print(f"rewards: {rewards.shape}")
-        for func_idx, func in enumerate(self.reward_functions):
-            rwds = rewards[func_idx].mean(dim=-1)
-            for r in rwds:
-                self.metrics[f"reward_{func.__name__}"].append(r.item())
-
-        prompt_lenghts = [[] for _ in range(self.batch_size)]
+        
+        # Log average reward across groups
+        avg_rewards = rewards.mean(dim=-1)
+        for r in avg_rewards:
+            self.metrics[f"reward"].append(r.item())
+        
+        # Log prompt lengths
+        prompt_lengths = [[] for _ in range(self.batch_size)]
         for idx, sample in enumerate(samples):
-            prompt_lenghts[idx % self.batch_size].append(len(sample["prompt"]))
-
-        for idx, pl in enumerate(prompt_lenghts):
-            self.metrics[f"prompt_length"].append(sum(pl)/len(pl))
-
-        return rewards.sum(dim=0)
+            prompt_lengths[idx % self.batch_size].append(len(sample["prompt"]))
+        
+        for idx, pl in enumerate(prompt_lengths):
+            self.metrics[f"prompt_length"].append(sum(pl) / len(pl))
+        
+        return rewards
     
     def log_metrics(self):
         if self.log_wandb:
@@ -203,7 +213,7 @@ class GRPO:
         
         Args:
             num_samples: Number of samples to evaluate. If None, evaluate all test_dataset.
-            eval_batch_size: Batch size for evaluation. If None, use self.batch_size.
+            eval_batch_size: Batch size for evaluation. If None, use larger batch for speed.
         
         Returns:
             dict: Dictionary containing average rewards and other metrics
@@ -213,7 +223,8 @@ class GRPO:
             return {}
         
         self.model.eval()
-        eval_batch_size = eval_batch_size or self.batch_size
+        # Use larger batch size for evaluation (default 8 for faster inference)
+        eval_batch_size = eval_batch_size or min(8, len(self.test_dataset))
         
         # Determine number of samples to evaluate
         if num_samples is None:
@@ -222,10 +233,9 @@ class GRPO:
             test_data = list(self.test_dataset.select(range(min(num_samples, len(self.test_dataset)))))
         
         all_rewards = []
-        all_responses = []
         
         print(f"\n{'='*50}")
-        print(f"Starting evaluation on {len(test_data)} samples...")
+        print(f"Starting evaluation on {len(test_data)} samples with batch_size={eval_batch_size}...")
         print(f"{'='*50}\n")
         
         with torch.no_grad():
@@ -246,29 +256,30 @@ class GRPO:
                 encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
                 input_ids = encoded["input_ids"]
                 
-                # Generate responses
+                # Generate responses (use greedy decoding for faster and more deterministic evaluation)
                 outputs = self.model.generate(
                     input_ids.to(self.device),
                     max_new_tokens=512,
-                    temperature=0.9,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    do_sample=True,
+                    num_beams=1,       # Explicitly use greedy search
+                    do_sample=False,   # Disable sampling
                 )
                 
                 # Decode outputs
                 decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                all_responses.extend(decoded_outputs)
                 
                 # Compute rewards for this batch
                 batch_rewards = []
                 for sample, resp in zip(batch_samples, decoded_outputs):
-                    reward = 0
-                    for func in self.reward_functions:
-                        reward += func(sample, resp)
+                    reward = self.reward_functions[0](sample, resp)
                     batch_rewards.append(reward)
                 
                 all_rewards.extend(batch_rewards)
+                
+                # Clear GPU cache periodically
+                if (i // eval_batch_size) % 10 == 0:
+                    torch.cuda.empty_cache()
         
         self.model.train()
         
