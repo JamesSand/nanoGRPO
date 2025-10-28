@@ -169,7 +169,7 @@ trainer = GRPO(
     micro_group_size=micro_group_size,
     dataset=dataset,
     reward_functions=reward_functions,
-    log_wandb=True,
+    log_wandb=False,
     lr=lr,
     weight_decay=weight_decay
 )
