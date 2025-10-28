@@ -6,6 +6,7 @@ import time
 import wandb
 import datetime
 from collections import defaultdict
+from tqdm import tqdm
 
 
 class GRPO:
@@ -32,6 +33,12 @@ class GRPO:
         self.model = model
         self.ref_model = ref_model
         self.tokenizer = tokenizer
+        
+        # Ensure tokenizer has pad_token set
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+            
         self.dataset = dataset.shuffle(seed=42)
         self.data_loader_iter = iter(self.dataset)
         self.group_size = group_size
@@ -108,7 +115,11 @@ class GRPO:
             item = next(self.data_loader_iter)
             samples.append(item)
             prompt = item["prompt"]
-            formatted = self.tokenizer.apply_chat_template(prompt, tokenize=False)
+            formatted = self.tokenizer.apply_chat_template(
+                prompt, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
             inputs_texts.append(formatted)
 
         encoded = self.tokenizer(inputs_texts, padding=True, return_tensors="pt")
@@ -128,11 +139,14 @@ class GRPO:
             max_new_tokens=max_new_tokens,
             temperature=0.9,
             # repetition_penalty=1.1,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            do_sample=True,
         )
         end_time = time.time()
         print(f"Time for generation: {end_time - start_time} seconds")
 
-        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=False)
+        decoded_outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
         
         rewards = self.compute_rewards(samples,decoded_outputs)
 
@@ -183,26 +197,15 @@ class GRPO:
     def train(self, epochs=1, max_iterations=1000):
         idx = 0
         start_time = time.perf_counter()
-        while idx < max_iterations:
+        
+        # while idx < max_iterations:
+            
+        for idx in tqdm(range(max_iterations)):
 
             x_batch_inputs, rewards, loss_mask = self.sample_batch()
-            torch.cuda.empty_cache() 
-
-            
-
 
             batch_inputs = x_batch_inputs.reshape(self.batch_size, self.group_size, *x_batch_inputs.shape[1:])
             loss_mask =       loss_mask.reshape(self.batch_size, self.group_size, *loss_mask.shape[1:])
-            torch.cuda.empty_cache() # gpu poor hack
-
-
-
-
-            # offload to cpu to save vram
-            batch_inputs = batch_inputs.cpu()
-            rewards = rewards.cpu()
-            loss_mask = loss_mask.cpu()
-            torch.cuda.empty_cache() # gpu poor hack
 
             pi_old = []
             for _, (b_inputs) in enumerate(batch_inputs):
@@ -211,8 +214,6 @@ class GRPO:
                     b_old_policy_log_probs = self.get_per_token_logps(self.model, b_inputs.to(self.device)).cpu()
                     torch.cuda.empty_cache()
                     pi_old.append(b_old_policy_log_probs)
-
-            
 
             for _, (b_inputs,b_old_policy_log_probs, b_reward, b_loss_mask) in enumerate(zip(batch_inputs, pi_old, rewards, loss_mask)):
                 idx += 1
@@ -245,8 +246,7 @@ class GRPO:
                         loss_mask
                     )
                     group_losses.append(loss.item())
-                    loss.backward()
-                    torch.cuda.empty_cache()    
+                    loss.backward() 
 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
@@ -256,8 +256,6 @@ class GRPO:
                     self.metrics["idx"].append(idx)
                     self.metrics["total_reward"].append(reward.mean().item())
                     self.metrics["loss"].append(sum(group_losses)/len(group_losses))
-
-                torch.cuda.empty_cache()
                 
             print(f"iter {idx}  >>> reward: {rewards.mean()}")
             print(f"Total time: {str(datetime.timedelta(seconds=int(time.perf_counter() - start_time)))}")

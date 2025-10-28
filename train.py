@@ -3,29 +3,48 @@ from datasets import Dataset, load_dataset
 from peft import LoraConfig, get_peft_model
 import torch
 from rich import print
-import math
+# import math
 from grpo import GRPO
+from math_verify import parse, verify
+import re
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 
-SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+# SYSTEM_PROMPT = "Respond in following format:<thinking>{step by step reasoning}</thinking><answer>{number}</answer>"
+
+instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+
+
+def extract_solution(solution_str):
+    solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
+    assert solution is not None
+    final_solution = solution.group(0)
+    final_solution = final_solution.split('#### ')[1].replace(',', '')
+    return final_solution
+    
 
 
 def prepare_dataset(dataset) -> Dataset:
-    extract_hash_answer = (
-        lambda text: text.split("####")[1].strip() if "####" in text else None
-    )
+    # extract_hash_answer = (
+    #     lambda text: text.split("####")[1].strip() if "####" in text else None
+    # )
 
     def process_example(example: dict):
-        answer = extract_hash_answer(example["answer"])
-        if answer is None:
-            return None
+        
+        answer_raw = example["answer"]
+        answer = extract_solution(answer_raw)
+        question = example["question"]
+        question = question + " " + instruction_following
+        
+        # answer = extract_hash_answer(example["answer"])
+        # if answer is None:
+        #     return None
         return {
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["question"]},
+                {"role": "system", "content": instruction_following},
+                {"role": "user", "content": question},
             ],
             "answer": answer,
         }
@@ -36,7 +55,7 @@ def prepare_dataset(dataset) -> Dataset:
             col for col in dataset.column_names if col not in ["prompt", "answer"]
         ],
     )
-    dataset = dataset.filter(lambda x: x is not None)
+    # dataset = dataset.filter(lambda x: x is not None)
 
     return dataset
 
@@ -62,88 +81,106 @@ model = get_peft_model(model, lora_config)
 model = model.to(torch.bfloat16)
 
 
-def reward_func_len(sample: dict, s: str, *args, **kwargs):
-    return 4 - (len(s)/1000)
+# def reward_func_len(sample: dict, s: str, *args, **kwargs):
+#     return 4 - (len(s)/1000)
 
-def response_format_reward(sample: dict, s: str, *args, **kwargs):
-    # print(sample.keys())
-    correct_template =0
-    try:
-        s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
-    except:
-        return -1
-    if "<|eot_id|>" in s:
-        s = s.split("<|eot_id|>")[0]
-    try:
-        print("-"*100)
-        print(s)
-        print("-"*100)
-    except:
-        ...
-    total_reward = 0
-    for tag in ["<thinking>", "</thinking>", "<answer>", "</answer>"]:
-        if tag in s:
-            total_reward+=0.15
-            if s.count(tag)>1:
-                total_reward -= s.count(tag)*0.01
+def math_verify_reward(sample: dict, s: str, *args, **kwargs):
+    
+    sample_answer = sample["answer"]
+    response_end = s[-300:]
+    
+    # print("Sample answer:", sample_answer)
+    # print("Response end:", response_end)
+    
+    # breakpoint()
+    
+    ground_truth = parse(sample_answer)
+    pred_answer = parse(response_end)
+    
+    return verify(ground_truth, pred_answer)
 
-    if s.count("<thinking>")==1:
-        total_reward += .5
-    else:
-        total_reward -= .1
 
-    if s.count("</thinking><answer>")==1:
-        total_reward += 1
-        correct_template += 1
-    else:
-        if s.count("<thinking>")==1:
-            total_reward += .2
-        else:
-            total_reward -= .1
-        if s.count("<answer>")==1:
-            total_reward += .2
-        else:
-            total_reward -= .1
 
-    if s.count("</answer>")==1 and s.split("</answer>")[1].strip() == "":
-            total_reward += 1
-    else:
-        total_reward -= 0.1
+# def response_format_reward(sample: dict, s: str, *args, **kwargs):
+#     # print(sample.keys())
+#     correct_template =0
+#     try:
+#         s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
+#     except:
+#         return -1
+#     if "<|eot_id|>" in s:
+#         s = s.split("<|eot_id|>")[0]
+#     try:
+#         print("-"*100)
+#         print(s)
+#         print("-"*100)
+#     except:
+#         ...
+#     total_reward = 0
+#     for tag in ["<thinking>", "</thinking>", "<answer>", "</answer>"]:
+#         if tag in s:
+#             total_reward+=0.15
+#             if s.count(tag)>1:
+#                 total_reward -= s.count(tag)*0.01
 
-    if s.count("<answer>")==1:
-        total_reward += .2
+#     if s.count("<thinking>")==1:
+#         total_reward += .5
+#     else:
+#         total_reward -= .1
 
-        r = s.split("<answer>")[1].strip()
-        if "</answer>" in r:
-            total_reward += .2
-            if r.count("</answer>")==1:
-                total_reward += 2 
-                split = r.split("</answer>")
-                r = split[0].strip()
-                try:
-                    r = float(r)
-                    total_reward += 1
-                    if r == float(sample["answer"]):
-                        total_reward += 2
-                        correct_template += 1
-                except:
-                    total_reward -= 0.1
+#     if s.count("</thinking><answer>")==1:
+#         total_reward += 1
+#         correct_template += 1
+#     else:
+#         if s.count("<thinking>")==1:
+#             total_reward += .2
+#         else:
+#             total_reward -= .1
+#         if s.count("<answer>")==1:
+#             total_reward += .2
+#         else:
+#             total_reward -= .1
 
-                if len(split) > 1:
-                    if split[1].strip() != "":
-                        total_reward += 3
-                        correct_template += 1
-                    else:
-                        total_reward -= len(split[1].strip())/1000
-                else:
-                    total_reward -= 0.2
-            else:
-                total_reward -= 0.1
-        else:
-            total_reward -=0.1
-    if correct_template == 3:
-        total_reward += 2
-    return total_reward
+#     if s.count("</answer>")==1 and s.split("</answer>")[1].strip() == "":
+#             total_reward += 1
+#     else:
+#         total_reward -= 0.1
+
+#     if s.count("<answer>")==1:
+#         total_reward += .2
+
+#         r = s.split("<answer>")[1].strip()
+#         if "</answer>" in r:
+#             total_reward += .2
+#             if r.count("</answer>")==1:
+#                 total_reward += 2 
+#                 split = r.split("</answer>")
+#                 r = split[0].strip()
+#                 try:
+#                     r = float(r)
+#                     total_reward += 1
+#                     if r == float(sample["answer"]):
+#                         total_reward += 2
+#                         correct_template += 1
+#                 except:
+#                     total_reward -= 0.1
+
+#                 if len(split) > 1:
+#                     if split[1].strip() != "":
+#                         total_reward += 3
+#                         correct_template += 1
+#                     else:
+#                         total_reward -= len(split[1].strip())/1000
+#                 else:
+#                     total_reward -= 0.2
+#             else:
+#                 total_reward -= 0.1
+#         else:
+#             total_reward -=0.1
+#     if correct_template == 3:
+#         total_reward += 2
+        
+#     return total_reward
 
 
 
@@ -155,10 +192,13 @@ micro_group_size =2
 lr = 5e-6
 weight_decay = 0.1
 reward_functions = [
-    response_format_reward,
+    # response_format_reward,
+    math_verify_reward,
 ]
 
-print(model)
+# print(model)
+
+enable_wandb = True
 
 ref_model = None
 trainer = GRPO(
@@ -169,7 +209,7 @@ trainer = GRPO(
     micro_group_size=micro_group_size,
     dataset=dataset,
     reward_functions=reward_functions,
-    log_wandb=False,
+    log_wandb=enable_wandb,
     lr=lr,
     weight_decay=weight_decay
 )
