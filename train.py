@@ -7,6 +7,7 @@ from rich import print
 from grpo import GRPO
 from math_verify import parse, verify
 import re
+import math_dapo
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
@@ -24,7 +25,6 @@ def extract_solution(solution_str):
     final_solution = final_solution.split('#### ')[1].replace(',', '')
     return final_solution
     
-
 
 def prepare_dataset(dataset) -> Dataset:
     # extract_hash_answer = (
@@ -81,6 +81,8 @@ model = get_peft_model(model, lora_config)
 model = model.to(torch.bfloat16)
 
 
+
+
 # def reward_func_len(sample: dict, s: str, *args, **kwargs):
 #     return 4 - (len(s)/1000)
 
@@ -89,99 +91,19 @@ def math_verify_reward(sample: dict, s: str, *args, **kwargs):
     sample_answer = sample["answer"]
     response_end = s[-300:]
     
+    res = math_dapo.compute_score(response_end, sample_answer, is_longcot=False, is_use_math_verify=True)
+    
+    return res
+    
     # print("Sample answer:", sample_answer)
     # print("Response end:", response_end)
     
     # breakpoint()
     
-    ground_truth = parse(sample_answer)
-    pred_answer = parse(response_end)
+    # ground_truth = parse(sample_answer)
+    # pred_answer = parse(response_end)
     
-    return verify(ground_truth, pred_answer)
-
-
-
-# def response_format_reward(sample: dict, s: str, *args, **kwargs):
-#     # print(sample.keys())
-#     correct_template =0
-#     try:
-#         s = s.split("<|eot_id|><|start_header_id|>assistant<|end_header_id|>")[1]
-#     except:
-#         return -1
-#     if "<|eot_id|>" in s:
-#         s = s.split("<|eot_id|>")[0]
-#     try:
-#         print("-"*100)
-#         print(s)
-#         print("-"*100)
-#     except:
-#         ...
-#     total_reward = 0
-#     for tag in ["<thinking>", "</thinking>", "<answer>", "</answer>"]:
-#         if tag in s:
-#             total_reward+=0.15
-#             if s.count(tag)>1:
-#                 total_reward -= s.count(tag)*0.01
-
-#     if s.count("<thinking>")==1:
-#         total_reward += .5
-#     else:
-#         total_reward -= .1
-
-#     if s.count("</thinking><answer>")==1:
-#         total_reward += 1
-#         correct_template += 1
-#     else:
-#         if s.count("<thinking>")==1:
-#             total_reward += .2
-#         else:
-#             total_reward -= .1
-#         if s.count("<answer>")==1:
-#             total_reward += .2
-#         else:
-#             total_reward -= .1
-
-#     if s.count("</answer>")==1 and s.split("</answer>")[1].strip() == "":
-#             total_reward += 1
-#     else:
-#         total_reward -= 0.1
-
-#     if s.count("<answer>")==1:
-#         total_reward += .2
-
-#         r = s.split("<answer>")[1].strip()
-#         if "</answer>" in r:
-#             total_reward += .2
-#             if r.count("</answer>")==1:
-#                 total_reward += 2 
-#                 split = r.split("</answer>")
-#                 r = split[0].strip()
-#                 try:
-#                     r = float(r)
-#                     total_reward += 1
-#                     if r == float(sample["answer"]):
-#                         total_reward += 2
-#                         correct_template += 1
-#                 except:
-#                     total_reward -= 0.1
-
-#                 if len(split) > 1:
-#                     if split[1].strip() != "":
-#                         total_reward += 3
-#                         correct_template += 1
-#                     else:
-#                         total_reward -= len(split[1].strip())/1000
-#                 else:
-#                     total_reward -= 0.2
-#             else:
-#                 total_reward -= 0.1
-#         else:
-#             total_reward -=0.1
-#     if correct_template == 3:
-#         total_reward += 2
-        
-#     return total_reward
-
+    # return verify(ground_truth, pred_answer)
 
 
 dataset = load_dataset("openai/gsm8k", "main")["train"]
