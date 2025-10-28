@@ -4,6 +4,8 @@ dev*
 wandb/
 cold_start/
 
+generation_samples.txt
+
 # Python
 __pycache__/
 *.py[cod]
